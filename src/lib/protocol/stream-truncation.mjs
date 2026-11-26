@@ -74,7 +74,8 @@ export function createAnthropicSseErrorRemapper({ headers = {}, isStarted = null
         pendingEvent = null
         return line
       }
-      if (!bare.startsWith('data:') || pendingEvent !== 'error') return line
+      if (!bare.startsWith('data:')) return line
+      const expectError = pendingEvent === 'error'
       pendingEvent = null
       let payload
       try {
@@ -82,6 +83,7 @@ export function createAnthropicSseErrorRemapper({ headers = {}, isStarted = null
       } catch {
         return line
       }
+      if (!expectError && payload?.type !== 'error') return line
       if (payload?.type !== 'error' && !payload?.error) return line
       const hopStatus = semanticStatusForStreamError(payload)
       const mapped = rewritePoolErrorForClient(mapUpstreamError(hopStatus, payload, headers), payload)
@@ -118,7 +120,8 @@ export function createAnthropicSseErrorRemapper({ headers = {}, isStarted = null
 export function createAnthropicStreamTracker() {
   let started = false
   let finished = false
-  let open = null
+  const openBlocks = new Map()
+  let lastOpenType = null
   let outputTokens = 0
   return {
     observe(line) {
@@ -140,10 +143,15 @@ export function createAnthropicStreamTracker() {
           outputTokens = event.message?.usage?.output_tokens || outputTokens
           break
         case 'content_block_start':
-          open = { index: event.index, type: event.content_block?.type }
+          if (Number.isInteger(event.index)) {
+            openBlocks.set(event.index, event.content_block?.type)
+            lastOpenType = event.content_block?.type || null
+          }
           break
         case 'content_block_stop':
-          if (open?.index === event.index) open = null
+          openBlocks.delete(event.index)
+          if (openBlocks.size === 0) lastOpenType = null
+          else lastOpenType = [...openBlocks.values()].at(-1) || null
           break
         case 'message_delta':
           outputTokens = event.usage?.output_tokens || outputTokens
@@ -161,7 +169,10 @@ export function createAnthropicStreamTracker() {
     },
     /** Type of the content block still open when the stream ended, or null. */
     openBlockType() {
-      return open?.type || null
+      for (const type of openBlocks.values()) {
+        if (type && !CLOSABLE_BLOCKS.has(type)) return type
+      }
+      return lastOpenType
     },
     isFinished() {
       return finished
@@ -169,9 +180,15 @@ export function createAnthropicStreamTracker() {
     /** SSE text that ends the message as max_tokens, or null when it cannot be closed. */
     closingEvents() {
       if (!started || finished) return null
-      if (open && !CLOSABLE_BLOCKS.has(open.type)) return null
+      for (const type of openBlocks.values()) {
+        if (!CLOSABLE_BLOCKS.has(type)) return null
+      }
       let out = ''
-      if (open) out += sse('content_block_stop', { type: 'content_block_stop', index: open.index })
+      for (const index of [...openBlocks.keys()].sort((a, b) => a - b)) {
+        out += sse('content_block_stop', { type: 'content_block_stop', index })
+      }
+      openBlocks.clear()
+      lastOpenType = null
       out += sse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'max_tokens', stop_sequence: null },

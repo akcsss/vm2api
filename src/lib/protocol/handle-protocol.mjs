@@ -179,6 +179,7 @@ import {
   isClaudeCodeFamilyRequest,
   isClaudeDesktopConnectionProbe,
 } from '../identity/claude-code-only.mjs'
+import { createAnthropicSseGuard } from './anthropic-sse-guard.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
 import {
   buildAnthropicSseError,
@@ -2142,6 +2143,17 @@ export function createHandleProtocol(deps) {
 
     const clientStream = protocol === 'google.gemini' ? effectiveRouteStream : isClientStream(inbound, req.headers)
     const streamTracker = clientStream && protocol === 'anthropic.messages' ? createAnthropicStreamTracker() : null
+    const sseAnomalies = []
+    const anthropicSseGuard =
+      clientStream && protocol === 'anthropic.messages'
+        ? createAnthropicSseGuard({
+            onAnomaly: (reason, detail) => {
+              if (sseAnomalies.length < 20) sseAnomalies.push({ reason, ...detail })
+              logBag.hop_meta = { ...logBag.hop_meta, sse_anomalies: sseAnomalies }
+              console.warn(`[sse-guard] request ${logCtx.request_id} ${reason}`, detail)
+            },
+          })
+        : null
     const anthropicSseErrorRemapper =
       clientStream && protocol === 'anthropic.messages'
         ? createAnthropicSseErrorRemapper({
@@ -2168,7 +2180,7 @@ export function createHandleProtocol(deps) {
             userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
             protocol,
             write: (chunk) => {
-              if (res.writableEnded || res.destroyed) return
+              if (res.writableEnded || res.destroyed || anthropicSseGuard?.isTerminated()) return
               if (!res.headersSent) writeSSEHeaders(res)
               res.write(chunk)
             },
@@ -2755,6 +2767,30 @@ export function createHandleProtocol(deps) {
             })
           keepalive.arm()
           const skipResponseHeaders = createResponseHeadersSseFilter()
+          const emitAnthropicFrames = (frames) => {
+            for (const frame of frames) {
+              let dataLine = frame.dataLine
+              let chunk = frame.chunk
+              if (dataLine && anthropicSseErrorRemapper) {
+                if (frame.eventName) anthropicSseErrorRemapper.remapLine(`event: ${frame.eventName}\n`)
+                const remapped = anthropicSseErrorRemapper.remapLine(`${dataLine}\n`).replace(/\r?\n$/, '')
+                if (remapped !== dataLine) {
+                  dataLine = remapped
+                  chunk = frame.eventName ? `event: ${frame.eventName}\n${dataLine}\n\n` : `${dataLine}\n\n`
+                }
+                anthropicSseErrorRemapper.remapLine('')
+              }
+              if (dataLine) {
+                streamTracker?.observe(dataLine)
+                keepalive.observeLine(dataLine)
+              } else {
+                keepalive.observeLine(chunk)
+              }
+              if (!res.headersSent) writeSSEHeaders(res)
+              res.write(chunk)
+              if (dataLine) publicStream?.observe(dataLine)
+            }
+          }
           try {
             const streamed = await dispatchStreamInference({
               exec: candidate.exec,
@@ -2795,15 +2831,11 @@ export function createHandleProtocol(deps) {
                 if (skipResponseHeaders(line)) return
                 line = restoreToolNamesInSSELine(line, attemptMeta?.toolNames || {})
                 if (personaHideTokens) line = hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl)
-                keepalive.observeLine(line)
                 if (protocol === 'anthropic.messages') {
-                  streamTracker?.observe(line)
-                  if (!res.headersSent) writeSSEHeaders(res)
-                  const outbound = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
-                  res.write(String(outbound).endsWith('\n') ? String(outbound) : String(outbound) + '\n')
-                  publicStream?.observe(outbound)
+                  emitAnthropicFrames(anthropicSseGuard.pushLine(line))
                   return
                 }
+                keepalive.observeLine(line)
                 const writeChunks = (chunks) => {
                   if (!chunks.length) return
                   if (!res.headersSent) writeSSEHeaders(res)
@@ -2827,6 +2859,9 @@ export function createHandleProtocol(deps) {
                 writeChunks(claudeSSELineToResponsesEvents(line, state))
               },
             })
+            if (protocol === 'anthropic.messages') {
+              emitAnthropicFrames(anthropicSseGuard.flush())
+            }
             if (protocol === 'google.gemini' && streamed?.ok && geminiCrossSseLines?.length) {
               const tc = await transcodeWithProtoFront({
                 cfg,
@@ -2844,6 +2879,7 @@ export function createHandleProtocol(deps) {
             if (streamed?.ok) rememberPublic(publicStream?.completedContent())
             return streamed
           } finally {
+            anthropicSseGuard?.resetFrame()
             if (anthropicKeepalive) anthropicKeepalive.endAttempt()
             else keepalive.stop()
           }

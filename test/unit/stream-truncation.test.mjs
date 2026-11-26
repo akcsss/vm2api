@@ -134,9 +134,20 @@ test('an unclosable started stream gets a retryable rate_limit_error and a logge
 
 test('started SSE stream remaps transient mid-response capture/stream errors to retryable rate_limit_error', () => {
   const cases = [
-    { type: 'error', error: { type: 'capture_error', message: 'Provider observation is incomplete' }, request_id: 'req_1' },
+    {
+      type: 'error',
+      error: { type: 'capture_error', message: 'Provider observation is incomplete' },
+      request_id: 'req_1',
+    },
     { type: 'error', error: { type: 'api_error', message: 'invalid native response stream' }, request_id: 'req_2' },
-    { type: 'error', error: { type: 'api_error', code: 'native_handoff_incomplete', message: 'Native provider response is incomplete' } },
+    {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'native_handoff_incomplete',
+        message: 'Native provider response is incomplete',
+      },
+    },
   ]
   for (const upstream of cases) {
     let notified = 0
@@ -147,7 +158,12 @@ test('started SSE stream remaps transient mid-response capture/stream errors to 
       },
     })
     started.remapLine('event: error\n')
-    const out = JSON.parse(started.remapLine(`data: ${JSON.stringify(upstream)}\n`).trim().slice(5))
+    const out = JSON.parse(
+      started
+        .remapLine(`data: ${JSON.stringify(upstream)}\n`)
+        .trim()
+        .slice(5),
+    )
     assert.equal(out.error.type, 'rate_limit_error')
     assert.equal(notified, 1)
     if (upstream.request_id) assert.equal(out.error.request_id, upstream.request_id)
@@ -155,7 +171,12 @@ test('started SSE stream remaps transient mid-response capture/stream errors to 
     // Before message_start, keep the real upstream_error taxonomy.
     const unstarted = createAnthropicSseErrorRemapper({ isStarted: () => false })
     unstarted.remapLine('event: error\n')
-    const outUnstarted = JSON.parse(unstarted.remapLine(`data: ${JSON.stringify(upstream)}\n`).trim().slice(5))
+    const outUnstarted = JSON.parse(
+      unstarted
+        .remapLine(`data: ${JSON.stringify(upstream)}\n`)
+        .trim()
+        .slice(5),
+    )
     assert.equal(outUnstarted.error.type, 'upstream_error')
   }
 
@@ -173,7 +194,12 @@ test('started SSE stream remaps transient mid-response capture/stream errors to 
       },
     })
     remapper.remapLine('event: error\n')
-    const out = JSON.parse(remapper.remapLine(`data: ${JSON.stringify(nonRetryable)}\n`).trim().slice(5))
+    const out = JSON.parse(
+      remapper
+        .remapLine(`data: ${JSON.stringify(nonRetryable)}\n`)
+        .trim()
+        .slice(5),
+    )
     assert.notEqual(out.error.type, 'rate_limit_error')
     assert.equal(notified, 0)
   }
@@ -195,7 +221,12 @@ test('the retryable-truncation callback receives the raw payload and the mapped 
     },
   })
   remapper.remapLine('event: error\n')
-  const out = JSON.parse(remapper.remapLine(`data: ${JSON.stringify(upstream)}\n`).trim().slice(5))
+  const out = JSON.parse(
+    remapper
+      .remapLine(`data: ${JSON.stringify(upstream)}\n`)
+      .trim()
+      .slice(5),
+  )
   assert.equal(out.error.type, 'rate_limit_error')
   assert.equal(seen.length, 1)
   const [payload, mapped] = seen[0]
@@ -204,4 +235,38 @@ test('the retryable-truncation callback receives the raw payload and the mapped 
   assert.equal(payload.error.message, 'Provider observation is incomplete')
   assert.ok(mapped?.body?.error, 'the mapped error must reach the callback too')
   assert.ok(mapped.status >= 500)
+})
+
+test('stream tracker closes all open closable blocks in order and rejects when any open block is thinking', () => {
+  const multi = createAnthropicStreamTracker()
+  multi.observe('data: {"type":"message_start","message":{"usage":{"output_tokens":5}}}\n\n')
+  multi.observe('data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n')
+  multi.observe(
+    'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read"}}\n\n',
+  )
+  const closing = multi.closingEvents()
+  const stops = [...closing.matchAll(/"type":"content_block_stop","index":(\d+)/g)].map((m) => Number(m[1]))
+  assert.deepEqual(stops, [0, 1])
+
+  const mixed = createAnthropicStreamTracker()
+  mixed.observe('data: {"type":"message_start","message":{"usage":{"output_tokens":2}}}\n\n')
+  mixed.observe('data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}\n\n')
+  mixed.observe('data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n')
+  assert.equal(mixed.openBlockType(), 'thinking')
+  assert.equal(mixed.closingEvents(), null)
+})
+
+test('error remapper also handles bare error data frames without a preceding event: error line', () => {
+  const upstream = {
+    type: 'error',
+    error: { type: 'api_error', message: 'invalid native response stream' },
+  }
+  const remapper = createAnthropicSseErrorRemapper({ isStarted: () => true })
+  const out = JSON.parse(
+    remapper
+      .remapLine(`data: ${JSON.stringify(upstream)}\n`)
+      .trim()
+      .slice(5),
+  )
+  assert.equal(out.error.type, 'rate_limit_error')
 })

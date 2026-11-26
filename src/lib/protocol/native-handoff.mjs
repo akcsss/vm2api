@@ -420,8 +420,10 @@ export async function consumeNativeHandoffStream(
   const publicPending = []
   const tools = new Set()
   const openBlocks = new Set()
+  const closedBlocks = new Set()
   const toolJson = new Map()
   const publicIndices = new Map()
+  let nextPublicIndex = 0
   let buffer = ''
   let frame = []
   let frameBytes = 0
@@ -448,7 +450,11 @@ export async function consumeNativeHandoffStream(
   const emit = async (event) => {
     let output = event
     if (Number.isInteger(event.index)) {
-      if (!publicIndices.has(event.index)) publicIndices.set(event.index, publicIndices.size)
+      if (event.type === 'content_block_start') {
+        publicIndices.set(event.index, nextPublicIndex++)
+      } else if (!publicIndices.has(event.index)) {
+        publicIndices.set(event.index, nextPublicIndex++)
+      }
       output = { ...event, index: publicIndices.get(event.index) }
     }
     if (!committed) {
@@ -511,6 +517,7 @@ export async function consumeNativeHandoffStream(
     if (event.type === 'content_block_start') {
       if (!Number.isInteger(event.index) || event.index < 0 || openBlocks.has(event.index))
         throw protocolError('native_handoff_invalid', 'Invalid native content block')
+      closedBlocks.delete(event.index)
       openBlocks.add(event.index)
       if (toolBlock(event.content_block)) {
         tools.add(event.index)
@@ -524,7 +531,11 @@ export async function consumeNativeHandoffStream(
     if (event.type === 'content_block_delta' && tools.has(event.index) && event.delta?.type === 'input_json_delta') {
       toolJson.set(event.index, toolJson.get(event.index) + (event.delta.partial_json || ''))
     }
-    if (event.type === 'content_block_stop') openBlocks.delete(event.index)
+    if (event.type === 'content_block_stop') {
+      if (!openBlocks.has(event.index)) return
+      openBlocks.delete(event.index)
+      closedBlocks.add(event.index)
+    }
     if (event.type === 'error') {
       lastError = event
       state.observeError(event)
@@ -620,8 +631,10 @@ export async function consumeNativeHandoffStream(
       if (!pending.some((event) => event.type === 'message_delta')) {
         throw protocolError('native_handoff_incomplete', 'Native stream has no terminal message_delta')
       }
-      if (committed && state.providerResult.stop_reason === 'max_tokens' && openBlocks.size) {
+      if (committed && state.providerResult.stop_reason !== 'tool_use' && openBlocks.size) {
+        const allowTools = state.providerResult.stop_reason === 'max_tokens'
         for (const index of [...openBlocks].sort((a, b) => a - b)) {
+          if (!allowTools && tools.has(index)) continue
           await emit({ type: 'content_block_stop', index })
         }
         openBlocks.clear()
